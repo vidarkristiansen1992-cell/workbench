@@ -2,154 +2,138 @@
 
 import React, { useRef, useState, useEffect } from "react";
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
-import { Sky, Html, Environment, ContactShadows } from "@react-three/drei";
-import { Physics, RigidBody, CuboidCollider } from "@react-three/rapier";
-import { EffectComposer, Bloom } from "@react-three/postprocessing";
+import { Sky, Html, Environment } from "@react-three/drei";
 import * as THREE from "three";
 
 const LIGHT_DURATIONS = { green: 6000, yellow: 1500, red: 5000 };
 
-// ─── Hit flash effects ────────────────────────────────────────────────────────
-function HitEffects({ hits }: { hits: Array<{ id: number; pos: { x: number; y: number; z: number }; t: number }> }) {
-  const [, setTick] = React.useState(0);
-  useFrame(() => setTick((v) => (v + 1) % 100000));
-  const now = Date.now();
-  const duration = 900;
-  return (
-    <group>
-      {hits.map((h) => {
-        const age = now - h.t;
-        if (age > duration) return null;
-        const life = age / duration;
-        const scale = 1 + life * 3;
-        const opacity = 1 - life;
-        return (
-          <mesh key={h.id} position={[h.pos.x, h.pos.y + 0.6, h.pos.z]} scale={[scale, scale, scale]}>
-            <sphereGeometry args={[0.18, 12, 10]} />
-            <meshStandardMaterial emissive={new THREE.Color(1, 0.7, 0.3)} color="#ffbb88" transparent opacity={opacity} />
-          </mesh>
-        );
-      })}
-    </group>
-  );
-}
-
-// ─── Third-person follow camera ───────────────────────────────────────────────
-function ThirdPersonCamera({ bodyRef }: { bodyRef: React.RefObject<any> }) {
+// ─── Third-person camera ──────────────────────────────────────────────────────
+function ThirdPersonCamera({ carRef }: { carRef: React.RefObject<THREE.Group | null> }) {
   const { camera } = useThree();
   useFrame(() => {
-    if (!bodyRef.current) return;
-    const pos = bodyRef.current.translation();
-    const rot = bodyRef.current.rotation();
-    const quat = new THREE.Quaternion(rot.x, rot.y, rot.z, rot.w);
-    const offset = new THREE.Vector3(0, 3.5, 8).applyQuaternion(quat);
-    const desired = new THREE.Vector3(pos.x, pos.y, pos.z).add(offset);
-    camera.position.lerp(desired, 0.1);
-    camera.lookAt(pos.x, pos.y + 1.2, pos.z);
+    if (!carRef.current) return;
+    const pos = carRef.current.position;
+    const angle = carRef.current.rotation.y;
+    const offset = new THREE.Vector3(
+      Math.sin(angle) * 8,
+      3.5,
+      Math.cos(angle) * 8
+    );
+    camera.position.lerp(pos.clone().add(offset), 0.1);
+    camera.lookAt(pos.x, pos.y + 1, pos.z);
   });
   return null;
 }
 
-// ─── Car ──────────────────────────────────────────────────────────────────────
-function Car({ position, onCrossStopLine, stoppedRef, onSpeedChange, bodyRef, paused }: {
-  position: [number, number, number];
+// ─── Car with manual physics ──────────────────────────────────────────────────
+interface CarProps {
+  carRef: React.RefObject<THREE.Group | null>;
   onCrossStopLine: () => void;
-  stoppedRef: React.MutableRefObject<{ crossed: boolean }>;
-  onSpeedChange?: (s: number) => void;
-  bodyRef: React.RefObject<any>;
+  stoppedRef: React.RefObject<{ crossed: boolean }>;
+  onSpeedChange: (s: number) => void;
   paused: boolean;
-}) {
-  const mass = 1200;
-  const engineForce = 6000;
-  const brakeForce = 18000;
-  const maxSteer = 1.6;
+  onBarrierHit: () => void;
+}
 
-  useEffect(() => {
-    if (bodyRef.current) bodyRef.current.setTranslation({ x: position[0], y: position[1], z: position[2] }, true);
-  }, [position]);
+function Car({ carRef, onCrossStopLine, stoppedRef, onSpeedChange, paused, onBarrierHit }: CarProps) {
+  const physics = useRef({ vx: 0, vz: 0, angle: 0 });
 
-  useFrame(() => {
+  useFrame((_, delta) => {
+    if (!carRef.current || paused) return;
+    const p = physics.current;
     const keys = (window as any)._trafficKeys || {};
-    const throttle = keys.ArrowUp ? 1 : 0;
-    const brake = keys.ArrowDown ? 1 : 0;
-    const steerLeft = keys.ArrowLeft ? 1 : 0;
-    const steerRight = keys.ArrowRight ? 1 : 0;
 
-    if (!bodyRef.current || paused) return;
+    const d = Math.min(delta, 0.05); // cap delta to prevent large jumps
 
-    const worldQuat = bodyRef.current.rotation();
-    const forward = new THREE.Vector3(0, 0, 1)
-      .applyQuaternion(new THREE.Quaternion(worldQuat.x, worldQuat.y, worldQuat.z, worldQuat.w))
-      .normalize();
-
-    if (throttle) {
-      bodyRef.current.applyForce({ x: forward.x * -engineForce, y: 0, z: forward.z * -engineForce }, true);
-    } else if (brake) {
-      const lin = bodyRef.current.linvel();
-      bodyRef.current.applyForce({
-        x: -lin.x * Math.min(brakeForce, Math.abs(lin.x) * 200),
-        y: 0,
-        z: -lin.z * Math.min(brakeForce, Math.abs(lin.z) * 200),
-      }, true);
-    } else {
-      const lin = bodyRef.current.linvel();
-      bodyRef.current.applyForce({ x: -lin.x * 120, y: 0, z: -lin.z * 120 }, true);
+    // Steering (only effective when moving)
+    const speed = Math.sqrt(p.vx * p.vx + p.vz * p.vz);
+    if (speed > 0.2) {
+      const steer = ((keys.ArrowLeft ? 1 : 0) - (keys.ArrowRight ? 1 : 0));
+      p.angle += steer * Math.min(speed * 0.4, 1.4) * d;
     }
 
-    const steer = steerLeft - steerRight;
-    if (steer) bodyRef.current.applyTorque({ x: 0, y: steer * maxSteer * 80, z: 0 }, true);
+    const fx = -Math.sin(p.angle);
+    const fz = -Math.cos(p.angle);
 
-    const vel = bodyRef.current.linvel();
-    const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z);
-    if (onSpeedChange) onSpeedChange(speed);
+    if (keys.ArrowUp) {
+      p.vx += fx * 18 * d;
+      p.vz += fz * 18 * d;
+    } else if (keys.ArrowDown) {
+      p.vx *= Math.max(0, 1 - 12 * d);
+      p.vz *= Math.max(0, 1 - 12 * d);
+    } else {
+      p.vx *= Math.max(0, 1 - 3 * d);
+      p.vz *= Math.max(0, 1 - 3 * d);
+    }
 
-    const pos = bodyRef.current.translation();
-    if (!stoppedRef.current.crossed && pos.z < 0) {
-      stoppedRef.current.crossed = true;
+    // Max speed cap
+    const spd = Math.sqrt(p.vx * p.vx + p.vz * p.vz);
+    if (spd > 14) { p.vx = p.vx / spd * 14; p.vz = p.vz / spd * 14; }
+
+    const mesh = carRef.current;
+    const nx = mesh.position.x + p.vx * d;
+    const nz = mesh.position.z + p.vz * d;
+
+    // Barrier collision (x bounds ±4.5)
+    if (Math.abs(nx) > 4.5) {
+      onBarrierHit();
+      p.vx = 0; p.vz = 0;
+      return;
+    }
+
+    mesh.position.x = nx;
+    mesh.position.z = nz;
+    mesh.rotation.y = p.angle;
+
+    onSpeedChange(spd);
+
+    if (!stoppedRef.current!.crossed && nz < 0) {
+      stoppedRef.current!.crossed = true;
       onCrossStopLine();
     }
   });
 
   return (
-    <RigidBody ref={bodyRef} type="dynamic" mass={mass} linearDamping={0.8} angularDamping={0.9}>
-      <mesh castShadow receiveShadow>
+    <group ref={carRef} position={[0, 0.3, 18]}>
+      {/* Body */}
+      <mesh castShadow>
         <boxGeometry args={[1.8, 0.6, 3]} />
-        <meshPhysicalMaterial color="#1f8ef1" metalness={0.6} roughness={0.15} clearcoat={0.2} />
+        <meshPhysicalMaterial color="#1f8ef1" metalness={0.6} roughness={0.15} />
       </mesh>
-      <CuboidCollider args={[0.9, 0.3, 1.5]} />
-      {([[ 0.9, 1], [-0.9, 1], [ 0.9, -1], [-0.9, -1]] as [number, number][]).map(([x, z], i) => (
-        <mesh key={i} position={[x, -0.25, z]} rotation={[0, 0, Math.PI / 2]}>
-          <cylinderGeometry args={[0.25, 0.25, 0.4, 16]} />
-          <meshStandardMaterial color="#111" metalness={0.2} roughness={0.6} />
+      {/* Cabin */}
+      <mesh castShadow position={[0, 0.45, -0.2]}>
+        <boxGeometry args={[1.4, 0.5, 1.6]} />
+        <meshPhysicalMaterial color="#0d5fa8" metalness={0.4} roughness={0.2} />
+      </mesh>
+      {/* Wheels */}
+      {([[0.95, 1], [-0.95, 1], [0.95, -1], [-0.95, -1]] as [number, number][]).map(([x, z], i) => (
+        <mesh key={i} position={[x, -0.22, z]} rotation={[0, 0, Math.PI / 2]} castShadow>
+          <cylinderGeometry args={[0.28, 0.28, 0.3, 16]} />
+          <meshStandardMaterial color="#111" />
         </mesh>
       ))}
-    </RigidBody>
+    </group>
   );
 }
 
 // ─── Traffic light ────────────────────────────────────────────────────────────
 function TrafficLight({ position, state }: { position: [number, number, number]; state: string }) {
-  const red = state === "red";
-  const yellow = state === "yellow";
-  const green = state === "green";
   return (
     <group position={position}>
       <mesh position={[0, 2.2, 0]}>
         <boxGeometry args={[0.5, 3.2, 0.4]} />
-        <meshStandardMaterial color="#202020" metalness={0.6} roughness={0.4} />
+        <meshStandardMaterial color="#202020" />
       </mesh>
-      <mesh position={[0, 2.8, 0.3]}>
-        <sphereGeometry args={[0.28, 16, 12]} />
-        <meshStandardMaterial emissive={red ? "#ff0000" : "#220000"} color={red ? "#ff4d4d" : "#330000"} />
-      </mesh>
-      <mesh position={[0, 2.2, 0.3]}>
-        <sphereGeometry args={[0.28, 16, 12]} />
-        <meshStandardMaterial emissive={yellow ? "#ffbf00" : "#221900"} color={yellow ? "#ffdf66" : "#332900"} />
-      </mesh>
-      <mesh position={[0, 1.6, 0.3]}>
-        <sphereGeometry args={[0.28, 16, 12]} />
-        <meshStandardMaterial emissive={green ? "#00ff00" : "#002200"} color={green ? "#7dff7d" : "#002200"} />
-      </mesh>
+      {[
+        { y: 2.8, active: state === "red",    on: "#ff0000", off: "#330000" },
+        { y: 2.2, active: state === "yellow", on: "#ffbf00", off: "#332900" },
+        { y: 1.6, active: state === "green",  on: "#00ff00", off: "#002200" },
+      ].map(({ y, active, on, off }) => (
+        <mesh key={y} position={[0, y, 0.25]}>
+          <sphereGeometry args={[0.25, 16, 12]} />
+          <meshStandardMaterial emissive={active ? on : "#000"} color={active ? on : off} />
+        </mesh>
+      ))}
     </group>
   );
 }
@@ -157,34 +141,40 @@ function TrafficLight({ position, state }: { position: [number, number, number];
 // ─── Road ─────────────────────────────────────────────────────────────────────
 function Road() {
   return (
-    <RigidBody type="fixed">
-      <group>
-        <mesh receiveShadow rotation={[-Math.PI / 2, 0, 0]}>
-          <planeGeometry args={[40, 200]} />
-          <meshStandardMaterial color="#222" />
-        </mesh>
-        {Array.from({ length: 30 }).map((_, i) => (
-          <mesh key={i} position={[0, 0.01, 90 - i * 6.5]} rotation={[-Math.PI / 2, 0, 0]}>
-            <planeGeometry args={[0.6, 3.6]} />
-            <meshStandardMaterial color="#fff" />
-          </mesh>
-        ))}
-        {/* Stop line */}
-        <mesh position={[0, 0.02, 1]} rotation={[-Math.PI / 2, 0, 0]}>
-          <planeGeometry args={[8, 0.14]} />
+    <group>
+      <mesh receiveShadow rotation={[-Math.PI / 2, 0, 0]} position={[0, 0, 0]}>
+        <planeGeometry args={[12, 220]} />
+        <meshStandardMaterial color="#282828" />
+      </mesh>
+      {/* Lane markings */}
+      {Array.from({ length: 30 }).map((_, i) => (
+        <mesh key={i} position={[0, 0.01, 90 - i * 6.5]} rotation={[-Math.PI / 2, 0, 0]}>
+          <planeGeometry args={[0.5, 3]} />
           <meshStandardMaterial color="#fff" />
         </mesh>
-      </group>
-    </RigidBody>
+      ))}
+      {/* Stop line */}
+      <mesh position={[0, 0.02, 1]} rotation={[-Math.PI / 2, 0, 0]}>
+        <planeGeometry args={[10, 0.2]} />
+        <meshStandardMaterial color="#fff" />
+      </mesh>
+      {/* Kerbs */}
+      {([-5.5, 5.5] as number[]).map((x) => (
+        <mesh key={x} receiveShadow position={[x, 0.05, 0]} rotation={[-Math.PI / 2, 0, 0]}>
+          <planeGeometry args={[0.8, 220]} />
+          <meshStandardMaterial color="#888" />
+        </mesh>
+      ))}
+    </group>
   );
 }
 
 // ─── Main component ───────────────────────────────────────────────────────────
 export default function TrafficGame() {
-  const carBodyRef = useRef<any>(null);
+  const carRef = useRef<THREE.Group>(null);
   const stoppedRef = useRef({ crossed: false });
 
-  const [lightState, setLightState] = useState("green");
+  const [lightState, setLightState] = useState<"green" | "yellow" | "red">("green");
   const lightStartRef = useRef(Date.now());
   const lightDurationRef = useRef(LIGHT_DURATIONS.green);
   const [lightTimeLeft, setLightTimeLeft] = useState(LIGHT_DURATIONS.green);
@@ -192,19 +182,10 @@ export default function TrafficGame() {
   const [status, setStatus] = useState<"playing" | "passed" | "failed">("playing");
   const [score, setScore] = useState(0);
   const [showInstructions, setShowInstructions] = useState(true);
-  const [speed, setSpeed] = useState(0); // m/s
+  const [speed, setSpeed] = useState(0);
   const [paused, setPaused] = useState(false);
-  const [hits, setHits] = useState<Array<{ id: number; pos: { x: number; y: number; z: number }; t: number }>>([]);
 
-  const savedVelRef = useRef<{ lin?: any; ang?: any } | null>(null);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const audioContextRef = useRef<any>(null);
-  const engineOscRef = useRef<any>(null);
-  const engineGainRef = useRef<any>(null);
-  const useAudioFallback = useRef(false);
-  const collisionAudioRef = useRef<HTMLAudioElement | null>(null);
-
-  // ── Light cycle ──────────────────────────────────────────────────────────────
+  // ── Light cycle ────────────────────────────────────────────────────────────
   const setLight = (state: "green" | "yellow" | "red") => {
     setLightState(state);
     lightStartRef.current = Date.now();
@@ -216,164 +197,48 @@ export default function TrafficGame() {
     const cycle = async () => {
       while (mounted) {
         setLight("green");
-        await new Promise((r) => setTimeout(r, LIGHT_DURATIONS.green));
+        await new Promise(r => setTimeout(r, LIGHT_DURATIONS.green));
         if (!mounted) break;
         setLight("yellow");
-        await new Promise((r) => setTimeout(r, LIGHT_DURATIONS.yellow));
+        await new Promise(r => setTimeout(r, LIGHT_DURATIONS.yellow));
         if (!mounted) break;
         setLight("red");
-        await new Promise((r) => setTimeout(r, LIGHT_DURATIONS.red));
+        await new Promise(r => setTimeout(r, LIGHT_DURATIONS.red));
       }
     };
     cycle();
     return () => { mounted = false; };
   }, []);
 
-  // Light timer countdown (100ms tick)
   useEffect(() => {
     const iv = setInterval(() => {
-      const elapsed = Date.now() - lightStartRef.current;
-      setLightTimeLeft(Math.max(0, lightDurationRef.current - elapsed));
+      setLightTimeLeft(Math.max(0, lightDurationRef.current - (Date.now() - lightStartRef.current)));
     }, 100);
     return () => clearInterval(iv);
   }, []);
 
-  // ── Audio setup ──────────────────────────────────────────────────────────────
+  // ── Keyboard ───────────────────────────────────────────────────────────────
   useEffect(() => {
-    const audio = new Audio("/sounds/engine_loop_short.mp3");
-    audio.loop = true;
-    audio.volume = 0.12;
-    audioRef.current = audio;
-    audio.play().catch(() => {
-      try {
-        const AC = window.AudioContext || (window as any).webkitAudioContext;
-        audioContextRef.current = new AC();
-        const ctx = audioContextRef.current;
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = 'sawtooth';
-        osc.frequency.value = 120;
-        gain.gain.value = 0.04;
-        osc.connect(gain);
-        gain.connect(ctx.destination);
-        osc.start();
-        engineOscRef.current = osc;
-        engineGainRef.current = gain;
-        useAudioFallback.current = true;
-      } catch {}
-    });
-
-    const ca = new Audio("/sounds/collision_small.ogg");
-    ca.volume = 0.28;
-    collisionAudioRef.current = ca;
-
-    return () => { try { audio.pause(); } catch {} };
-  }, []);
-
-  // Engine audio pitch by speed
-  useEffect(() => {
-    const a = audioRef.current;
-    if (!a) return;
-    const rate = 1 + Math.min(1.3, speed / 12);
-    a.playbackRate = rate;
-    a.volume = 0.06 + Math.min(0.8, speed / 20);
-    if (useAudioFallback.current && engineOscRef.current && engineGainRef.current) {
-      try {
-        engineOscRef.current.frequency.value = 80 + speed * 20;
-        engineGainRef.current.gain.value = 0.02 + Math.min(0.18, speed / 60);
-      } catch {}
-    }
-  }, [speed]);
-
-  const playCollisionSound = () => {
-    try {
-      const a = collisionAudioRef.current;
-      if (a) { a.currentTime = 0; a.play().catch(() => playNoiseBurst()); }
-      else playNoiseBurst();
-    } catch {}
-  };
-
-  const playNoiseBurst = () => {
-    try {
-      const ctx = audioContextRef.current || new (window.AudioContext || (window as any).webkitAudioContext)();
-      const sr = ctx.sampleRate;
-      const buf = ctx.createBuffer(1, sr * 0.2, sr);
-      const d = buf.getChannelData(0);
-      for (let i = 0; i < d.length; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / d.length) * 0.6;
-      const src = ctx.createBufferSource();
-      src.buffer = buf;
-      const g = ctx.createGain(); g.gain.value = 0.12;
-      src.connect(g); g.connect(ctx.destination); src.start();
-    } catch {}
-  };
-
-  const addHit = (pos: { x: number; y: number; z: number }) => {
-    const id = Date.now() + Math.floor(Math.random() * 1000);
-    setHits((h) => [...h, { id, pos, t: Date.now() }]);
-  };
-
-  // Prune old hits
-  useEffect(() => {
-    const iv = setInterval(() => {
-      setHits((h) => h.filter((x) => x.t >= Date.now() - 1000));
-    }, 250);
-    return () => clearInterval(iv);
-  }, []);
-
-  // ── Keyboard ─────────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const keys: any = {};
+    const keys: Record<string, boolean> = {};
     (window as any)._trafficKeys = keys;
     const down = (e: KeyboardEvent) => {
       if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
-        e.preventDefault();
-        keys[e.key] = true;
-        setShowInstructions(false);
+        e.preventDefault(); keys[e.key] = true; setShowInstructions(false);
       } else if (e.key.toLowerCase() === "p") {
-        e.preventDefault();
-        setPaused((v) => !v);
+        e.preventDefault(); setPaused(v => !v);
       }
     };
     const up = (e: KeyboardEvent) => {
       if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(e.key)) {
-        e.preventDefault();
-        keys[e.key] = false;
+        e.preventDefault(); keys[e.key] = false;
       }
     };
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
-    return () => {
-      window.removeEventListener("keydown", down);
-      window.removeEventListener("keyup", up);
-    };
+    return () => { window.removeEventListener("keydown", down); window.removeEventListener("keyup", up); };
   }, []);
 
-  // ── Pause/resume ─────────────────────────────────────────────────────────────
-  useEffect(() => {
-    const body = carBodyRef.current;
-    const a = audioRef.current;
-    if (paused) {
-      if (body) {
-        try {
-          savedVelRef.current = { lin: body.linvel(), ang: body.angvel() };
-          body.setLinvel({ x: 0, y: 0, z: 0 });
-          body.setAngvel({ x: 0, y: 0, z: 0 });
-        } catch {}
-      }
-      try { a?.pause(); } catch {}
-    } else {
-      if (body && savedVelRef.current) {
-        try {
-          body.setLinvel(savedVelRef.current.lin);
-          body.setAngvel(savedVelRef.current.ang);
-        } catch {}
-      }
-      try { a?.play().catch(() => {}); } catch {}
-      savedVelRef.current = null;
-    }
-  }, [paused]);
-
-  // ── Auto-reset after pass/fail ────────────────────────────────────────────────
+  // ── Auto-reset ─────────────────────────────────────────────────────────────
   useEffect(() => {
     if (status === "passed" || status === "failed") {
       const t = setTimeout(() => reset(), 4000);
@@ -381,209 +246,154 @@ export default function TrafficGame() {
     }
   }, [status]);
 
-  // ── Game logic ────────────────────────────────────────────────────────────────
+  // ── Game logic ─────────────────────────────────────────────────────────────
   const onCrossStopLine = () => {
-    if (lightState === "red") {
-      setStatus("failed");
-    } else {
-      setScore((s) => s + 1);
-      setStatus("passed");
-    }
+    if (lightState === "red") setStatus("failed");
+    else { setScore(s => s + 1); setStatus("passed"); }
   };
 
   const onBarrierHit = () => {
-    setStatus("failed");
-    playCollisionSound();
-    const p = carBodyRef.current?.translation ? carBodyRef.current.translation() : { x: 0, y: 0, z: 0 };
-    addHit(p);
+    if (status === "playing") setStatus("failed");
   };
 
   const reset = () => {
     stoppedRef.current.crossed = false;
     setStatus("playing");
-    try {
-      const b = carBodyRef.current;
-      if (b) {
-        b.setTranslation({ x: 0, y: 0.4, z: 18 }, true);
-        b.setLinvel({ x: 0, y: 0, z: 0 });
-        b.setAngvel({ x: 0, y: 0, z: 0 });
-      }
-    } catch {
-      window.location.reload();
+    if (carRef.current) {
+      carRef.current.position.set(0, 0.3, 18);
+      carRef.current.rotation.set(0, 0, 0);
     }
+    // reset physics
+    const el = carRef.current as any;
+    if (el?.__physics) { el.__physics.vx = 0; el.__physics.vz = 0; el.__physics.angle = 0; }
   };
 
-  // ── HUD helpers ───────────────────────────────────────────────────────────────
-  const speedKmh = Math.round(speed * 3.6);
+  // ── HUD values ─────────────────────────────────────────────────────────────
+  const speedKmh = Math.round(speed * 3.6 * 4); // scale for feel
   const lightProgress = Math.min(1, (lightDurationRef.current - lightTimeLeft) / lightDurationRef.current);
   const lightColor = lightState === "red" ? "#ef4444" : lightState === "yellow" ? "#f59e0b" : "#22c55e";
   const lightLabel = lightState === "red" ? "RØD" : lightState === "yellow" ? "GUL" : "GRØNN";
 
   return (
-    <div style={{ position: "relative", width: "100%", height: "720px", background: "#000" }}>
-
-      {/* Reset button (always visible during play) */}
+    <div style={{ position: "relative", width: "100%", height: "720px" }}>
       <div style={{ position: "absolute", left: 12, bottom: 12, zIndex: 50 }}>
-        <button
-          onClick={reset}
-          style={{ padding: "8px 14px", background: "rgba(0,0,0,0.7)", color: "#fff", borderRadius: 8, border: "1px solid #444", cursor: "pointer" }}
-        >
+        <button onClick={reset} style={{ padding: "8px 14px", background: "rgba(0,0,0,0.7)", color: "#fff", borderRadius: 8, border: "1px solid #444", cursor: "pointer" }}>
           Reset
         </button>
       </div>
 
-      <Canvas shadows camera={{ position: [0, 6, 12], fov: 50 }} style={{ background: "linear-gradient(#7fb0ff, #0b1724)" }}>
-        <Physics gravity={[0, -9.81, 0]}>
-          <ambientLight intensity={0.6} />
-          <directionalLight castShadow position={[5, 12, 5]} intensity={1.2} shadow-mapSize-width={2048} shadow-mapSize-height={2048} />
-          <Sky sunPosition={[100, 20, 100]} />
-          <Environment preset="sunset" />
+      <Canvas shadows camera={{ position: [0, 6, 24], fov: 50 }} style={{ background: "linear-gradient(#7fb0ff, #0b1724)" }}>
+        <ambientLight intensity={0.7} />
+        <directionalLight castShadow position={[5, 12, 5]} intensity={1.2} shadow-mapSize={[1024, 1024]} />
+        <Sky sunPosition={[100, 20, 100]} />
+        <Environment preset="sunset" />
 
-          <Road />
+        <Road />
 
-          <group position={[0, 0, -14]}>
-            <TrafficLight position={[3.6, 0, 0]} state={lightState} />
-            <TrafficLight position={[-3.6, 0, 0]} state={lightState} />
-          </group>
+        {/* Traffic lights */}
+        <group position={[0, 0, -14]}>
+          <TrafficLight position={[4, 0, 0]} state={lightState} />
+          <TrafficLight position={[-4, 0, 0]} state={lightState} />
+        </group>
 
-          {/* Side barriers */}
-          {([5, -5] as number[]).map((x) => (
-            <RigidBody key={x} type="fixed" position={[x, 0.8, 2]} onCollisionEnter={onBarrierHit}>
-              <mesh castShadow>
-                <boxGeometry args={[1.2, 1.6, 0.6]} />
-                <meshStandardMaterial color="#7b1e1e" />
-              </mesh>
-            </RigidBody>
-          ))}
-
-          <Car
-            position={[0, 0.4, 18]}
-            onCrossStopLine={onCrossStopLine}
-            stoppedRef={stoppedRef}
-            onSpeedChange={setSpeed}
-            bodyRef={carBodyRef}
-            paused={paused}
-          />
-
-          <ThirdPersonCamera bodyRef={carBodyRef} />
-
-          <ContactShadows position={[0, -0.01, 20]} opacity={0.6} scale={18} blur={2} far={6} />
-          <HitEffects hits={hits} />
-
-          {/* Stop line post */}
-          <mesh receiveShadow position={[0, 0, -1]}>
-            <boxGeometry args={[0.2, 2.4, 0.2]} />
-            <meshStandardMaterial color="#fff" />
+        {/* Side barriers (visual) */}
+        {([-5.1, 5.1] as number[]).map((x) => (
+          <mesh key={x} castShadow position={[x, 0.5, 5]}>
+            <boxGeometry args={[0.4, 1, 30]} />
+            <meshStandardMaterial color="#7b1e1e" />
           </mesh>
+        ))}
 
-          <EffectComposer>
-            <Bloom luminanceThreshold={0.6} luminanceSmoothing={0.9} intensity={0.9} />
-          </EffectComposer>
+        <Car
+          carRef={carRef}
+          onCrossStopLine={onCrossStopLine}
+          stoppedRef={stoppedRef}
+          onSpeedChange={setSpeed}
+          paused={paused}
+          onBarrierHit={onBarrierHit}
+        />
 
-          <Html fullscreen>
-            <div style={{ pointerEvents: "none", fontFamily: "monospace" }}>
+        <ThirdPersonCamera carRef={carRef} />
 
-              {/* ── Top-left HUD ── */}
-              <div style={{ position: "absolute", left: 18, top: 18, display: "flex", flexDirection: "column", gap: 10 }}>
+        <Html fullscreen>
+          <div style={{ pointerEvents: "none", fontFamily: "monospace" }}>
 
-                {/* Traffic light status + timer bar */}
-                <div style={{ background: "rgba(0,0,0,0.65)", borderRadius: 10, padding: "10px 14px", minWidth: 180 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-                    <div style={{ width: 14, height: 14, borderRadius: "50%", background: lightColor, boxShadow: `0 0 8px ${lightColor}` }} />
-                    <span style={{ color: lightColor, fontWeight: "bold", fontSize: 15 }}>{lightLabel}</span>
-                    <span style={{ color: "#aaa", fontSize: 12, marginLeft: "auto" }}>{(lightTimeLeft / 1000).toFixed(1)}s</span>
-                  </div>
-                  {/* Progress bar */}
-                  <div style={{ background: "#333", borderRadius: 4, height: 6, overflow: "hidden" }}>
-                    <div style={{
-                      height: "100%", borderRadius: 4,
-                      background: lightColor,
-                      width: `${lightProgress * 100}%`,
-                      transition: "width 0.1s linear, background 0.3s"
-                    }} />
-                  </div>
+            {/* Top-left HUD */}
+            <div style={{ position: "absolute", left: 18, top: 18, display: "flex", flexDirection: "column", gap: 10 }}>
+              {/* Light + timer */}
+              <div style={{ background: "rgba(0,0,0,0.65)", borderRadius: 10, padding: "10px 14px", minWidth: 180 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <div style={{ width: 14, height: 14, borderRadius: "50%", background: lightColor, boxShadow: `0 0 8px ${lightColor}` }} />
+                  <span style={{ color: lightColor, fontWeight: "bold", fontSize: 15 }}>{lightLabel}</span>
+                  <span style={{ color: "#aaa", fontSize: 12, marginLeft: "auto" }}>{(lightTimeLeft / 1000).toFixed(1)}s</span>
                 </div>
-
-                {/* Speedometer */}
-                <div style={{ background: "rgba(0,0,0,0.65)", borderRadius: 10, padding: "8px 14px" }}>
-                  <div style={{ color: "#fff", fontSize: 22, fontWeight: "bold" }}>
-                    {speedKmh} <span style={{ fontSize: 12, color: "#aaa" }}>km/h</span>
-                  </div>
-                  <div style={{ background: "#333", borderRadius: 4, height: 4, marginTop: 4, overflow: "hidden" }}>
-                    <div style={{
-                      height: "100%", borderRadius: 4,
-                      background: speedKmh > 60 ? "#ef4444" : speedKmh > 30 ? "#f59e0b" : "#22c55e",
-                      width: `${Math.min(100, speedKmh / 120 * 100)}%`,
-                      transition: "width 0.1s"
-                    }} />
-                  </div>
-                </div>
-
-                {/* Score */}
-                <div style={{ background: "rgba(0,0,0,0.65)", borderRadius: 10, padding: "8px 14px" }}>
-                  <div style={{ color: "#facc15", fontSize: 13 }}>POENG</div>
-                  <div style={{ color: "#fff", fontSize: 26, fontWeight: "bold" }}>{score}</div>
+                <div style={{ background: "#333", borderRadius: 4, height: 6, overflow: "hidden" }}>
+                  <div style={{ height: "100%", borderRadius: 4, background: lightColor, width: `${lightProgress * 100}%`, transition: "width 0.1s linear" }} />
                 </div>
               </div>
 
-              {/* ── Instructions ── */}
-              {showInstructions && (
-                <div style={{ position: "absolute", right: 18, top: 18, color: "#fff", maxWidth: 220, background: "rgba(0,0,0,0.55)", padding: 12, borderRadius: 10, fontSize: 13 }}>
-                  <div style={{ fontWeight: "bold", marginBottom: 6 }}>Kontroller</div>
-                  <div>↑ gass &nbsp; ↓ brems</div>
-                  <div>← → styr</div>
-                  <div>P pause</div>
-                  <div style={{ marginTop: 8, color: "#facc15", fontSize: 12 }}>
-                    Stopp før den hvite linjen når lyset er RØDt. Kjør over når det er GRØNt.
-                  </div>
+              {/* Speedometer */}
+              <div style={{ background: "rgba(0,0,0,0.65)", borderRadius: 10, padding: "8px 14px" }}>
+                <div style={{ color: "#fff", fontSize: 22, fontWeight: "bold" }}>
+                  {speedKmh} <span style={{ fontSize: 12, color: "#aaa" }}>km/h</span>
                 </div>
-              )}
-
-              {/* ── Paused overlay ── */}
-              {paused && (
-                <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "auto" }}>
-                  <div style={{ background: "rgba(0,0,0,0.85)", color: "#fff", padding: 24, borderRadius: 12, textAlign: "center" }}>
-                    <div style={{ fontSize: 28, fontWeight: "bold", marginBottom: 8 }}>PAUSE</div>
-                    <div style={{ color: "#aaa" }}>Trykk P for å fortsette</div>
-                  </div>
+                <div style={{ background: "#333", borderRadius: 4, height: 4, marginTop: 4, overflow: "hidden" }}>
+                  <div style={{ height: "100%", borderRadius: 4, background: speedKmh > 80 ? "#ef4444" : speedKmh > 40 ? "#f59e0b" : "#22c55e", width: `${Math.min(100, speedKmh / 120 * 100)}%`, transition: "width 0.1s" }} />
                 </div>
-              )}
+              </div>
 
-              {/* ── Failed overlay ── */}
-              {status === "failed" && (
-                <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "auto" }}>
-                  <div style={{ background: "rgba(0,0,0,0.82)", color: "#fff", padding: 28, borderRadius: 14, textAlign: "center", minWidth: 260 }}>
-                    <div style={{ fontSize: 36 }}>🚨</div>
-                    <div style={{ fontSize: 24, fontWeight: "bold", color: "#ef4444", marginBottom: 8 }}>FEIL — Rødt lys!</div>
-                    <div style={{ color: "#ccc", marginBottom: 6 }}>Du kjørte over på rødt.</div>
-                    <div style={{ color: "#888", fontSize: 12, marginBottom: 14 }}>Resetter automatisk…</div>
-                    <button onClick={reset} style={{ padding: "9px 18px", background: "#ef4444", color: "#fff", borderRadius: 8, border: "none", cursor: "pointer", fontWeight: "bold" }}>
-                      Prøv igjen
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {/* ── Passed overlay ── */}
-              {status === "passed" && (
-                <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "auto" }}>
-                  <div style={{ background: "rgba(0,0,0,0.82)", color: "#fff", padding: 28, borderRadius: 14, textAlign: "center", minWidth: 260 }}>
-                    <div style={{ fontSize: 36 }}>✅</div>
-                    <div style={{ fontSize: 24, fontWeight: "bold", color: "#22c55e", marginBottom: 8 }}>Bra kjørt!</div>
-                    <div style={{ color: "#ccc", marginBottom: 4 }}>Du stoppet og kjørte riktig.</div>
-                    <div style={{ color: "#facc15", fontSize: 18, marginBottom: 6 }}>Poeng: {score}</div>
-                    <div style={{ color: "#888", fontSize: 12, marginBottom: 14 }}>Resetter automatisk…</div>
-                    <button onClick={reset} style={{ padding: "9px 18px", background: "#22c55e", color: "#fff", borderRadius: 8, border: "none", cursor: "pointer", fontWeight: "bold" }}>
-                      Spill igjen
-                    </button>
-                  </div>
-                </div>
-              )}
-
+              {/* Score */}
+              <div style={{ background: "rgba(0,0,0,0.65)", borderRadius: 10, padding: "8px 14px" }}>
+                <div style={{ color: "#facc15", fontSize: 13 }}>POENG</div>
+                <div style={{ color: "#fff", fontSize: 26, fontWeight: "bold" }}>{score}</div>
+              </div>
             </div>
-          </Html>
 
-        </Physics>
+            {/* Instructions */}
+            {showInstructions && (
+              <div style={{ position: "absolute", right: 18, top: 18, color: "#fff", maxWidth: 200, background: "rgba(0,0,0,0.55)", padding: 12, borderRadius: 10, fontSize: 13 }}>
+                <div style={{ fontWeight: "bold", marginBottom: 6 }}>Kontroller</div>
+                <div>↑ gass &nbsp; ↓ brems</div>
+                <div>← → styr &nbsp; P pause</div>
+                <div style={{ marginTop: 8, color: "#facc15", fontSize: 11 }}>Stopp før hvit linje når lyset er RØDT. Kjør over på GRØNT.</div>
+              </div>
+            )}
+
+            {/* Paused */}
+            {paused && (
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "auto" }}>
+                <div style={{ background: "rgba(0,0,0,0.85)", color: "#fff", padding: 24, borderRadius: 12, textAlign: "center" }}>
+                  <div style={{ fontSize: 28, fontWeight: "bold", marginBottom: 8 }}>PAUSE</div>
+                  <div style={{ color: "#aaa" }}>Trykk P for å fortsette</div>
+                </div>
+              </div>
+            )}
+
+            {/* Failed */}
+            {status === "failed" && (
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "auto" }}>
+                <div style={{ background: "rgba(0,0,0,0.82)", color: "#fff", padding: 28, borderRadius: 14, textAlign: "center", minWidth: 260 }}>
+                  <div style={{ fontSize: 36 }}>🚨</div>
+                  <div style={{ fontSize: 24, fontWeight: "bold", color: "#ef4444", marginBottom: 8 }}>FEIL!</div>
+                  <div style={{ color: "#ccc", marginBottom: 14 }}>Prøv igjen.</div>
+                  <button onClick={reset} style={{ padding: "9px 18px", background: "#ef4444", color: "#fff", borderRadius: 8, border: "none", cursor: "pointer", fontWeight: "bold" }}>Prøv igjen</button>
+                </div>
+              </div>
+            )}
+
+            {/* Passed */}
+            {status === "passed" && (
+              <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "auto" }}>
+                <div style={{ background: "rgba(0,0,0,0.82)", color: "#fff", padding: 28, borderRadius: 14, textAlign: "center", minWidth: 260 }}>
+                  <div style={{ fontSize: 36 }}>✅</div>
+                  <div style={{ fontSize: 24, fontWeight: "bold", color: "#22c55e", marginBottom: 8 }}>Bra kjørt!</div>
+                  <div style={{ color: "#facc15", fontSize: 18, marginBottom: 14 }}>Poeng: {score}</div>
+                  <button onClick={reset} style={{ padding: "9px 18px", background: "#22c55e", color: "#fff", borderRadius: 8, border: "none", cursor: "pointer", fontWeight: "bold" }}>Spill igjen</button>
+                </div>
+              </div>
+            )}
+          </div>
+        </Html>
       </Canvas>
     </div>
   );
